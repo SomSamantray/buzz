@@ -144,7 +144,7 @@ const overrides = new Map([
   // migrated to ManagedAgentRuntimeKey. Integrated at merge; queued to split.
   // +12 (2272 -> 2284): rebase onto main — main's #2397 shim guard in
   // configure_runtime_cli lands under this PR's resolver changes. Queued.
-  ["src-tauri/src/managed_agents/runtime.rs", 2284],
+  ["src-tauri/src/managed_agents/runtime.rs", 2291],
   // config-bridge setup-payload env-boundary fix adds readiness wiring in
   // spawn_agent_child; load-bearing security fix, queued to split.
   ["src-tauri/src/managed_agents/config_bridge/reader.rs", 1016],
@@ -196,7 +196,7 @@ const overrides = new Map([
   // configure_runtime_cli (fix #2397). Test-only growth; queued to split.
   // +7 (1041 -> 1048): rebase onto main — this PR's resolver tests land on top
   // of main's #2397 Windows shim tests. Test-only; queued to split.
-  ["src-tauri/src/managed_agents/runtime/tests.rs", 1048],
+  ["src-tauri/src/managed_agents/runtime/tests.rs", 1055],
   // applyWorkspace reposDir parameter plus the validateReposDir binding,
   // threaded through Tauri invokes for configurable repos_dir, plus the
   // harness-persona-sync `harnessOverride` create-input bit — load-bearing
@@ -489,7 +489,7 @@ const overrides = new Map([
   // extraction and its regression tests.
   // +4 (1101 -> 1105): rebase onto agents-everywhere — agents.rs function
   // signatures updated for ManagedAgentRuntimeKey-keyed runtimes map.
-  ["src-tauri/src/commands/agent_models.rs", 1105],
+  ["src-tauri/src/commands/agent_models.rs", 1113],
   // global-agent-config: get_agent_config_surface / write_agent_config_field /
   // put_agent_session_config commands + GlobalAgentConfig serde types. New file
   // in this PR; queued to split with the command module refactor.
