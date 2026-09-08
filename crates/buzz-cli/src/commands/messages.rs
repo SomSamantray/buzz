@@ -606,6 +606,11 @@ pub struct SendMessageParams {
     pub broadcast: bool,
     pub files: Vec<String>,
     pub mentions: Vec<String>,
+    pub allow_empty: bool,
+    /// True when the caller passed `--content -`. Captured by the dispatcher
+    /// before `read_or_stdin` replaces the `-` sentinel, so the emptiness
+    /// guard can name stdin as the likely source of a pipeline failure.
+    pub content_from_stdin: bool,
 }
 
 pub async fn cmd_send_message(
@@ -618,6 +623,24 @@ pub async fn cmd_send_message(
     // bugs for agent and human users alike.
     p.content = read_or_stdin(&p.content)?;
     validate_content_size(&p.content)?;
+
+    // Refuse to publish an empty message. Empty content has no recipient
+    // value, and on the stdin path it almost always means an upstream
+    // pipeline step failed — the caller needs a non-zero exit, not a
+    // successful publish of a ghost bubble. A `--file` send is exempt because
+    // media assembly below appends the attachment to `final_content`.
+    if !p.allow_empty && p.files.is_empty() && p.content.trim().is_empty() {
+        return Err(CliError::Usage(if p.content_from_stdin {
+            "refusing to publish an empty message from stdin (an upstream pipeline step \
+             likely failed). Pass --allow-empty to confirm."
+                .into()
+        } else {
+            "refusing to publish an empty message: --content is empty or whitespace-only. \
+             Pass --allow-empty to confirm."
+                .into()
+        }));
+    }
+
     if let Some(ref r) = p.reply_to {
         validate_hex64(r)?;
     }
@@ -945,7 +968,9 @@ pub async fn dispatch(
             broadcast,
             files,
             mentions,
+            allow_empty,
         } => {
+            let content_from_stdin = content == "-";
             cmd_send_message(
                 client,
                 SendMessageParams {
@@ -956,6 +981,8 @@ pub async fn dispatch(
                     broadcast,
                     files,
                     mentions,
+                    allow_empty,
+                    content_from_stdin,
                 },
             )
             .await
@@ -1717,6 +1744,8 @@ mod tests {
             broadcast: false,
             files: vec![],
             mentions: vec![],
+            allow_empty: false,
+            content_from_stdin: false,
         }
     }
 
@@ -1886,6 +1915,149 @@ mod tests {
         assert!(
             emoji_tags.is_empty(),
             "palette-error fallback must produce no emoji tags, got: {emoji_tags:?}"
+        );
+    }
+
+    // ── cmd_send_message — empty-content guard ─────────────────────────────
+    //
+    // These drive the production path through the same fake relay as the tests
+    // above and assert `captured_event` stays `None`, so a guard that only
+    // lives in a helper cannot satisfy them. Removing the guard at
+    // `cmd_send_message` makes each of these fail.
+
+    #[tokio::test]
+    async fn cmd_send_message_rejects_empty_content() {
+        let (url, _query_count, captured_event) = fake_send_relay(send_palette_response()).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+
+        let err = cmd_send_message(&client, send_params(""))
+            .await
+            .expect_err("empty content must be rejected");
+
+        assert!(
+            matches!(err, CliError::Usage(_)),
+            "expected Usage, got {err:?}"
+        );
+        assert!(
+            captured_event.lock().unwrap().is_none(),
+            "no event may be published for empty content"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_send_message_rejects_whitespace_only_content() {
+        for content in ["\n", "   ", "\t\n "] {
+            let (url, _query_count, captured_event) =
+                fake_send_relay(send_palette_response()).await;
+            let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+
+            let err = cmd_send_message(&client, send_params(content))
+                .await
+                .expect_err("whitespace-only content must be rejected");
+
+            assert!(
+                matches!(err, CliError::Usage(_)),
+                "expected Usage for {content:?}, got {err:?}"
+            );
+            assert!(
+                captured_event.lock().unwrap().is_none(),
+                "no event may be published for {content:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cmd_send_message_rejects_empty_content_before_mention_preflight() {
+        // `--mention` forces a relay membership fetch. The emptiness guard must
+        // run first, so an unreachable or unhelpful relay cannot replace the
+        // empty-content diagnosis with an unrelated failure.
+        let (url, _query_count, captured_event) = fake_send_relay(send_palette_response()).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+        let mut params = send_params("");
+        params.mentions = vec!["a".repeat(64)];
+
+        let err = cmd_send_message(&client, params)
+            .await
+            .expect_err("empty content must be rejected before the mention preflight");
+
+        // The message must be the empty-content diagnosis, not the membership
+        // failure the preflight would otherwise raise.
+        let CliError::Usage(msg) = &err else {
+            panic!("expected the empty-content Usage error, got {err:?}");
+        };
+        assert!(
+            msg.contains("empty message"),
+            "expected the empty-content diagnosis, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("not channel members"),
+            "the mention preflight must not run first, got {msg:?}"
+        );
+        assert!(
+            captured_event.lock().unwrap().is_none(),
+            "no event may be published"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_send_message_publishes_empty_content_with_allow_empty() {
+        let (url, _query_count, captured_event) = fake_send_relay(send_palette_response()).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+        let mut params = send_params("");
+        params.allow_empty = true;
+
+        cmd_send_message(&client, params)
+            .await
+            .expect("--allow-empty must permit an empty publish");
+
+        assert!(
+            captured_event.lock().unwrap().is_some(),
+            "the event must be published when --allow-empty is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_send_message_names_stdin_when_it_produced_the_emptiness() {
+        let (url, _query_count, captured_event) = fake_send_relay(send_palette_response()).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+        let mut params = send_params("\n");
+        params.content_from_stdin = true;
+
+        let err = cmd_send_message(&client, params)
+            .await
+            .expect_err("stdin whitespace must be rejected");
+
+        let CliError::Usage(msg) = &err else {
+            panic!("expected Usage, got {err:?}");
+        };
+        assert!(
+            msg.contains("upstream pipeline step"),
+            "the stdin path must name the likely cause, got {msg:?}"
+        );
+        assert!(
+            captured_event.lock().unwrap().is_none(),
+            "no event may be published"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_send_message_does_not_apply_empty_guard_to_file_sends() {
+        // A caption-less `--file` send carries empty text but publishes
+        // non-empty content. The guard must not fire, so the send proceeds to
+        // the upload and fails there instead.
+        let (url, _query_count, _captured_event) = fake_send_relay(send_palette_response()).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+        let mut params = send_params("");
+        params.files = vec!["/nonexistent/attachment.png".to_string()];
+
+        let err = cmd_send_message(&client, params)
+            .await
+            .expect_err("uploading a missing file must fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("upload failed"),
+            "the empty-content guard must not fire on a file send, got {msg:?}"
         );
     }
 }
